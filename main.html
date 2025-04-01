@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    <title>Three.js Lightning Effect</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000510; color: white; font-family: Arial, sans-serif; }
+        canvas { display: block; }
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.6);
+            padding: 10px;
+            border-radius: 5px;
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        #controls label, #controls span, #controls button {
+            white-space: nowrap;
+            margin-bottom: 5px;
+        }
+        #frequencySlider { width: 150px; }
+        #frequencyValue { min-width: 110px; text-align: right; }
+        #soundToggleBtn {
+            background-color: #f44336; /* Default to Red (OFF) */
+            border: none;
+            color: white;
+            padding: 5px 10px;
+            text-align: center;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 12px;
+            border-radius: 3px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        #soundToggleBtn.on { background-color: #4CAF50; }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <label for="frequencySlider">Frequency:</label>
+        <input type="range" id="frequencySlider" min="100" max="5000" step="100" value="1000">
+        <span id="frequencyValue">Max Interval: 1000ms</span>
+        <button id="soundToggleBtn">Sound: OFF</button>
+    </div>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/"
+        }
+      }
+    </script>
+
+    <script type="module">
+        // Import necessary modules
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // Scene variables
+        let scene, camera, renderer, composer, controls;
+        let nextStrikeTimeoutId = null;
+        let activeGroundCrackles = []; // Array for active ground crackle effects
+        let lastFrameTime = null; // For delta time calculation (if needed)
+
+        // Sound related variables
+        let crackSynth = null; // For sharp crack sound
+        let rumbleSynth = null; // For rumble sound
+        let rumbleFilter = null; // Filter for rumble
+        let reverb = null; // Reverb effect
+        let toneStarted = false; // Flag if Tone.js context has started
+        let isSoundEnabled = false; // Flag for sound toggle (default OFF)
+
+        // --- Shader Code ---
+        const lightningLineVertexShader = ` void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); } `;
+        // Main lightning line Fragment Shader (Enhanced)
+        const lightningLineFragmentShader = `
+            uniform float uTime; uniform float uOpacity; uniform vec3 uColor; uniform vec3 uGlowColor; uniform vec3 uAltColor;
+            // Pseudo-random function
+            float rand(vec2 co){ return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453); }
+            // Basic noise function
+            float noise(vec2 p) { vec2 i = floor(p); vec2 f = fract(p); f = f*f*(3.0-2.0*f); float a = rand(i); float b = rand(i + vec2(1.0, 0.0)); float c = rand(i + vec2(0.0, 1.0)); float d = rand(i + vec2(1.0, 1.0)); return mix(mix(a, b, f.x), mix(c, d, f.x), f.y); }
+            // Fractal Brownian Motion (more complex noise)
+            float fbm(vec2 p) { float v=0.0; float a=0.5; for (int i=0; i<5; i++) { v+=a*noise(p); p*=2.0; a*=0.5; } return v; }
+            void main() {
+                float time = uTime * 2.2; // Speed up time slightly more
+                float flicker = 0.15; // Lower base brightness
+                // Complex flicker/noise calculation
+                flicker += 0.6 * pow(sin(time * 10.0 + gl_FragCoord.y * 0.07) * 0.5 + 0.5, 4.5);
+                flicker += 0.5 * pow(cos(time * 90.0 - gl_FragCoord.x * 0.1) * 0.5 + 0.5, 7.0);
+                flicker += 0.7 * fbm(gl_FragCoord.xy * 0.03 + time * 0.4);
+                flicker += pow(rand(gl_FragCoord.xy * 0.25 + floor(time * 55.0)) * 0.4 + 0.6, 20.0) * 1.2;
+                flicker += pow(1.0 - abs(sin(time * 120.0)), 35.0) * 1.8; // Sharp core flash
+
+                float flickerIntensity = clamp(flicker, 0.0, 3.5); // Allow higher intensity
+                float finalOpacity = uOpacity * clamp(flicker, 0.0, 1.0); // Opacity capped
+                if (finalOpacity < 0.05) discard; // Discard threshold
+
+                // Color mixing based on intensity
+                vec3 color1 = mix(uColor, uGlowColor, smoothstep(0.15, 0.6, flickerIntensity));
+                vec3 finalColor = mix(color1, uAltColor, smoothstep(0.6, 2.0, flickerIntensity));
+
+                // Increase brightness significantly for bloom effect
+                gl_FragColor = vec4(finalColor * (1.0 + smoothstep(0.4, 2.5, flickerIntensity) * 2.8), finalOpacity);
+            }
+        `;
+        // Glow line Fragment Shader (Simplified)
+        const glowLineFragmentShader = ` uniform float uOpacity; uniform vec3 uColor; void main() { gl_FragColor = vec4(uColor, uOpacity * 0.6); } `;
+        // Ground crackle Fragment Shader (Enhanced)
+        const groundCrackleFragmentShader = `
+            uniform float uTime; uniform float uOpacity; uniform vec3 uColor; uniform vec3 uGlowColor;
+            float rand(vec2 co){ return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453); }
+            void main() {
+                float flicker = 0.3; // Lower base brightness
+                flicker += 0.7 * pow(sin(uTime * 28.0 + gl_FragCoord.x * 0.15) * 0.5 + 0.5, 3.5); // Pulse
+                flicker += 0.6 * rand(gl_FragCoord.xy * 0.12 + floor(uTime * 50.0)); // Randomness
+
+                float finalOpacity = uOpacity * clamp(flicker, 0.05, 1.0); // Lower min brightness
+                if (finalOpacity < 0.01) discard;
+
+                vec3 finalColor = mix(uColor, uGlowColor, clamp(flicker * 2.0 - 1.5, 0.0, 1.0)); // Color mix
+                gl_FragColor = vec4(finalColor * 1.6, finalOpacity); // Increase brightness for bloom
+            }
+        `;
+
+        // --- Lightning Generation Parameters (Final Tuning) ---
+        const lightningParams = {
+            startPoint: new THREE.Vector3(0, 150, 0), endPointY: -150, maxDisplacement: 30, minSegmentLength: 5, branchProbability: 0.3, maxBranches: 3, branchAngleVariation: Math.PI / 4, branchLengthFactor: 0.6,
+            drawDuration: 90, impactFlashDuration: 110, postFlashDuration: 70,
+            groundCrackleDuration: 380, groundCrackleColor: 0x87CEFA, groundCrackleGlowColor: 0xffffff, groundCrackleBranches: 9, groundCrackleMaxDepth: 5, groundCrackleDisplacement: 9,
+            lightningBaseColor: 0xffffff, lightningGlowColor: 0x87CEFA, lightningAltColor: 0x9370DB,
+            impactSphereSize: 8, impactSphereColor: 0xffffff, impactSphereDuration: 90,
+            glowLineColor: 0x87CEFA, numberOfGlowLines: 2,
+            bloomThreshold: 0.03, bloomStrength: 1.6, bloomRadius: 1.0
+        };
+
+        // DOM element references
+        let frequencySlider, frequencyValueSpan, soundToggleBtn;
+
+        // Initialization logic
+        document.addEventListener('DOMContentLoaded', () => {
+            frequencySlider = document.getElementById('frequencySlider');
+            frequencyValueSpan = document.getElementById('frequencyValue');
+            soundToggleBtn = document.getElementById('soundToggleBtn');
+
+            updateFrequencyParams();
+            frequencySlider.value = lightningParams.strikeIntervalMax;
+            updateFrequencyDisplay();
+            updateSoundButton(); // Set initial button state (OFF)
+
+            // Frequency slider event listener
+            frequencySlider.addEventListener('input', async () => {
+                await startToneIfNeeded(); // Check if Tone needs starting
+                updateFrequencyParams();
+                updateFrequencyDisplay();
+            });
+
+            // Sound toggle button event listener
+            soundToggleBtn.addEventListener('click', async () => {
+                isSoundEnabled = !isSoundEnabled; // Toggle sound state
+                await startToneIfNeeded(); // Start Tone if enabling sound and not started
+                updateSoundButton(); // Update button appearance
+            });
+
+            init(); // Initialize Three.js and Tone.js
+            animate(); // Start animation loop
+            scheduleNextStrike(); // Schedule the first strike
+        });
+
+        // Function to start Tone.js context if needed and enabled
+        async function startToneIfNeeded() {
+            if (!toneStarted && isSoundEnabled) {
+                try {
+                    await Tone.start();
+                    console.log('Audio context started');
+                    toneStarted = true;
+                } catch (e) {
+                    console.error("Tone.start failed:", e);
+                }
+            }
+        }
+
+        // Function to update the sound button's text and style
+        function updateSoundButton() {
+            if (isSoundEnabled) {
+                soundToggleBtn.textContent = 'Sound: ON';
+                soundToggleBtn.classList.add('on');
+                soundToggleBtn.classList.remove('off');
+            } else {
+                soundToggleBtn.textContent = 'Sound: OFF';
+                soundToggleBtn.classList.remove('on');
+                soundToggleBtn.classList.add('off');
+            }
+        }
+
+        // Function to update frequency parameters from slider
+        function updateFrequencyParams() {
+            const maxInterval = parseInt(frequencySlider.value);
+            lightningParams.strikeIntervalMax = maxInterval;
+            lightningParams.strikeIntervalMin = Math.max(100, maxInterval * 0.1);
+        }
+        // Function to update frequency display text
+        function updateFrequencyDisplay() {
+            frequencyValueSpan.textContent = `Max Interval: ${lightningParams.strikeIntervalMax}ms`;
+        }
+
+        // Initialize Three.js scene, camera, renderer, effects, controls, and sound
+        function init() {
+            // Scene setup
+            scene = new THREE.Scene();
+            const fogColor = 0x000510; // Dark blue fog/background
+            scene.fog = new THREE.Fog(fogColor, 80, 450); // Adjust fog range
+            // Camera setup
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 50, 300);
+            // Renderer setup
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setClearColor(fogColor); // Set background color
+            document.body.appendChild(renderer.domElement);
+            // Grid helper
+            const gridHelper = new THREE.GridHelper(400, 20, 0x333333, 0x333333); // Darker grid
+            gridHelper.position.y = lightningParams.endPointY;
+            scene.add(gridHelper);
+            // Post Processing (Bloom) setup
+            const renderScene = new RenderPass(scene, camera);
+            const bloomPass = new UnrealBloomPass( new THREE.Vector2(window.innerWidth, window.innerHeight), lightningParams.bloomStrength, lightningParams.bloomRadius, lightningParams.bloomThreshold );
+            composer = new EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPass);
+            // Orbit Controls setup
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true; controls.dampingFactor = 0.05; controls.screenSpacePanning = false;
+            controls.minDistance = 50; controls.maxDistance = 600; controls.maxPolarAngle = Math.PI / 1.1;
+
+            // Sound setup (Tone.js) - Final adjustments
+            reverb = new Tone.Reverb({ decay: 1.8, preDelay: 0.02, wet: 0.55 }).toDestination(); // Increased wetness
+            crackSynth = new Tone.MembraneSynth({ pitchDecay: 0.008, octaves: 12, envelope: { attack: 0.0005, decay: 0.02, sustain: 0, release: 0.05 } }).connect(reverb);
+            crackSynth.volume.value = 0; // Crack sound volume
+            rumbleFilter = new Tone.AutoFilter({ frequency: "6m", baseFrequency: 80, octaves: 4 }).connect(reverb).start();
+            rumbleSynth = new Tone.NoiseSynth({ noise: { type: 'brown' }, envelope: { attack: 0.02, decay: 1.2, sustain: 0, release: 0.8 } }).connect(rumbleFilter);
+            rumbleSynth.volume.value = -10; // Rumble sound volume
+
+            // Resize listener
+            window.addEventListener('resize', onWindowResize, false);
+        }
+        // Handle window resize
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight); // Resize composer too
+        }
+
+        // Recursive function to create lightning segments
+        function createLightningSegment(start, end, displacement, segments, branchLevel = 0, isGround = false, maxDepth = 3) {
+            const distance = start.distanceTo(end);
+            const direction = end.clone().sub(start).normalize();
+            // Base case for recursion depth or segment length
+            if (isGround && branchLevel >= maxDepth) { segments.push(start.clone(), end.clone()); return; }
+            if (!isGround && distance < lightningParams.minSegmentLength) { segments.push(start.clone(), end.clone()); return; }
+            if (isGround && distance < lightningParams.minSegmentLength * 0.5) { segments.push(start.clone(), end.clone()); return; }
+            // Calculate midpoint and apply perpendicular displacement
+            const midPoint = start.clone().add(end).multiplyScalar(0.5);
+            const perpendicular = new THREE.Vector3(-direction.z, 0, direction.x); // Perpendicular in XZ plane for ground
+            if (!isGround) { perpendicular.set(-direction.y, direction.x, 0); perpendicular.z = (Math.random() - 0.5) * 0.5; } // Original 3D displacement
+            perpendicular.normalize();
+            const randomDisplacement = (Math.random() - 0.5) * displacement;
+            midPoint.add(perpendicular.multiplyScalar(randomDisplacement));
+            if (isGround) midPoint.y = start.y; // Keep ground crackles on the ground plane
+            // Recurse for sub-segments
+            const nextDisplacement = displacement * 0.6;
+            createLightningSegment(start, midPoint, nextDisplacement, segments, branchLevel + 1, isGround, maxDepth);
+            createLightningSegment(midPoint, end, nextDisplacement, segments, branchLevel + 1, isGround, maxDepth);
+            // Create branches probabilistically
+            const probability = isGround ? lightningParams.branchProbability * 1.5 : lightningParams.branchProbability;
+            const maxBranchesForLevel = isGround ? lightningParams.maxBranches + 1 : lightningParams.maxBranches;
+            if (branchLevel < maxBranchesForLevel && Math.random() < probability) {
+                const branchEndPoint = midPoint.clone(); const branchDirection = direction.clone();
+                const angleVariation = isGround ? Math.PI / 2 : lightningParams.branchAngleVariation;
+                const angle = (Math.random() - 0.5) * 2 * angleVariation;
+                const rotationAxis = isGround ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(0, 0, 1); // Rotate around Y for ground
+                branchDirection.applyAxisAngle(rotationAxis, angle);
+                const lengthFactor = isGround ? 0.7 : lightningParams.branchLengthFactor;
+                const branchLength = distance * lengthFactor * (0.5 + Math.random() * 0.5);
+                branchEndPoint.add(branchDirection.multiplyScalar(branchLength));
+                if (isGround) branchEndPoint.y = start.y; // Keep branch on ground
+                createLightningSegment(midPoint, branchEndPoint, nextDisplacement, segments, branchLevel + 1, isGround, maxDepth);
+            }
+        }
+
+        // Function to create a new lightning strike
+        function strike() {
+            const segments = [];
+            const startPoint = lightningParams.startPoint.clone();
+            // Randomize start X and Z
+            startPoint.x = (Math.random() - 0.5) * 250;
+            startPoint.z = (Math.random() - 0.5) * 250;
+            // Calculate end point relative to start point with small offset
+            const endPoint = new THREE.Vector3(
+                startPoint.x + (Math.random() - 0.5) * 60,
+                lightningParams.endPointY,
+                startPoint.z + (Math.random() - 0.5) * 60
+            );
+            // Generate segments for the main bolt
+            createLightningSegment(startPoint, endPoint, lightningParams.maxDisplacement, segments, 0, false, lightningParams.maxBranches);
+
+            if (segments.length < 2) return; // Need at least one segment
+
+            // Create shared geometry
+            const geometry = new THREE.BufferGeometry();
+            const positions = segments.flatMap(v => v.toArray());
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            const totalPoints = positions.length / 3;
+            geometry.drawRange = { start: 0, count: 0 }; // Initialize draw range
+
+            // Create main lightning line material and object
+            const mainLineMaterial = new THREE.ShaderMaterial({ vertexShader: lightningLineVertexShader, fragmentShader: lightningLineFragmentShader, uniforms: THREE.UniformsUtils.clone({ uTime: { value: 0.0 }, uOpacity: { value: 0.0 }, uColor: { value: new THREE.Color(lightningParams.lightningBaseColor) }, uGlowColor: { value: new THREE.Color(lightningParams.lightningGlowColor) }, uAltColor: { value: new THREE.Color(lightningParams.lightningAltColor) } }), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending });
+            const mainLightning = new THREE.LineSegments(geometry, mainLineMaterial);
+
+            // Create glow lines using the same geometry
+            const glowLines = [];
+            for (let i = 0; i < lightningParams.numberOfGlowLines; i++) {
+                const glowLineMaterial = new THREE.ShaderMaterial({ vertexShader: lightningLineVertexShader, fragmentShader: glowLineFragmentShader, uniforms: THREE.UniformsUtils.clone({ uOpacity: { value: 0.0 }, uColor: { value: new THREE.Color(lightningParams.glowLineColor) } }), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending });
+                const glowLine = new THREE.LineSegments(geometry, glowLineMaterial);
+                glowLines.push(glowLine);
+            }
+            // Store references in userData
+            mainLightning.userData = { startTime: Date.now(), totalPoints: totalPoints, drawCompleted: false, drawTimeoutId: null, material: mainLineMaterial, glowLines: glowLines, geometry: geometry };
+            // Add to scene
+            scene.add(mainLightning);
+            glowLines.forEach(line => scene.add(line));
+            // Start animation
+            animateLightningDraw(mainLightning);
+            // Schedule next strike
+            scheduleNextStrike();
+        }
+
+        // Animate the drawing of the lightning bolt and its glow lines
+        function animateLightningDraw(mainLightning) {
+            const now = Date.now(); const userData = mainLightning.userData; const startTime = userData.startTime; const elapsed = now - startTime;
+            const drawDuration = lightningParams.drawDuration; const totalPoints = userData.totalPoints; const mainMaterial = userData.material; const glowLines = userData.glowLines; const geometry = userData.geometry;
+            const progress = Math.min(1.0, elapsed / drawDuration); const targetCount = Math.min(totalPoints, Math.ceil(totalPoints * progress / 2) * 2);
+            // Check if object still exists
+            if (!mainLightning || !geometry || !scene.getObjectById(mainLightning.id)) { if (userData && userData.drawTimeoutId) { clearTimeout(userData.drawTimeoutId); } return; }
+            // Update draw range for shared geometry
+            geometry.drawRange.count = targetCount;
+            // Update uniforms for main line
+            mainMaterial.uniforms.uTime.value = elapsed / 1000.0;
+            mainMaterial.uniforms.uOpacity.value = 0.95 + Math.random() * 0.05; // Base opacity while drawing
+            // Update uniforms for glow lines
+            glowLines.forEach(line => { line.material.uniforms.uOpacity.value = 0.5 + Math.random() * 0.15; }); // Base opacity for glow lines
+            // Continue animation or trigger impact
+            if (progress < 1.0) { userData.drawTimeoutId = setTimeout(() => animateLightningDraw(mainLightning), 16); }
+            else if (!userData.drawCompleted) { userData.drawCompleted = true; userData.drawTimeoutId = null; flashImpact(mainLightning); }
+        }
+
+        // Handle the impact flash, sound, ground effects, and sphere animation
+        function flashImpact(mainLightning) {
+            const userData = mainLightning.userData; const mainMaterial = userData.material; const glowLines = userData.glowLines; if (!mainLightning || !mainMaterial || !scene.getObjectById(mainLightning.id)) return;
+            // Maximize opacity for flash
+            mainMaterial.uniforms.uOpacity.value = 1.0;
+            glowLines.forEach(line => { line.material.uniforms.uOpacity.value = 0.9; });
+
+            // Play sound if enabled
+            if (isSoundEnabled && toneStarted && crackSynth && rumbleSynth) {
+                const now = Tone.now(); const randomOffset = Math.random() * 0.02;
+                crackSynth.triggerAttackRelease("C2", "64n", now + randomOffset); // Short crack
+                rumbleSynth.triggerAttackRelease("1n", now + randomOffset + 0.01); // Longer rumble
+            }
+
+            // Create ground effects and impact sphere
+            if (mainLightning.geometry && mainLightning.geometry.attributes.position) {
+                const positions = mainLightning.geometry.attributes.position.array;
+                if (positions.length >= 3) {
+                    // Ensure ground effects start exactly at ground level
+                    const endPointForGround = new THREE.Vector3( positions[positions.length - 3], lightningParams.endPointY, positions[positions.length - 1] );
+                    createGroundCrackl(endPointForGround); // Create ground crackle lines
+
+                    // Create and animate impact sphere
+                    const sphereGeo = new THREE.SphereGeometry(1, 16, 8); // Start with radius 1 for scaling
+                    const sphereMat = new THREE.MeshBasicMaterial({ color: lightningParams.impactSphereColor, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false });
+                    const impactSphere = new THREE.Mesh(sphereGeo, sphereMat);
+                    impactSphere.position.copy(endPointForGround);
+                    impactSphere.scale.set(0.1, 0.1, 0.1); // Start small
+                    scene.add(impactSphere);
+                    animateImpactSphere(impactSphere); // Start scale animation
+                    // Schedule sphere removal
+                    setTimeout(() => { if (scene.getObjectById(impactSphere.id)) { scene.remove(impactSphere); impactSphere.geometry.dispose(); impactSphere.material.dispose(); } }, lightningParams.impactSphereDuration);
+                }
+            }
+            // Schedule removal of the main lightning bolt and its glow lines
+            setTimeout(() => { setTimeout(() => { removeLightning(mainLightning); }, lightningParams.postFlashDuration); }, lightningParams.impactFlashDuration);
+         }
+
+         // Animate the impact sphere's scale
+         function animateImpactSphere(sphere) {
+             const duration = lightningParams.impactSphereDuration * 0.8; // Animation duration slightly less than total duration
+             const maxSize = lightningParams.impactSphereSize;
+             const startTime = Date.now();
+             function scaleAnim() {
+                 const elapsed = Date.now() - startTime;
+                 const progress = Math.min(1.0, elapsed / duration);
+                 const scale = maxSize * Math.sin(progress * Math.PI); // Pulse effect (0 -> max -> 0)
+                 if (sphere && scene.getObjectById(sphere.id)) { // Check if sphere still exists
+                     sphere.scale.set(scale, scale, scale);
+                     if (progress < 1.0) { requestAnimationFrame(scaleAnim); } // Continue animation
+                 }
+             }
+             scaleAnim(); // Start the animation
+         }
+
+         // Create the ground crackle effect
+         function createGroundCrackl(position) {
+             const segments = []; const startPoint = position.clone(); const numBranches = lightningParams.groundCrackleBranches;
+             // Generate segments recursively
+             for (let i = 0; i < numBranches; i++) { const angle = (i / numBranches) * Math.PI * 2 + (Math.random() - 0.5) * (Math.PI / numBranches); const branchDirection = new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle)); const branchLength = 15 + Math.random() * 15; const branchEndPoint = startPoint.clone().add(branchDirection.multiplyScalar(branchLength)); createLightningSegment(startPoint, branchEndPoint, lightningParams.groundCrackleDisplacement, segments, 0, true, lightningParams.groundCrackleMaxDepth); }
+             if (segments.length === 0) return;
+             // Create geometry and material
+             const geometry = new THREE.BufferGeometry(); const positions = segments.flatMap(v => v.toArray()); geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3)); const totalPoints = positions.length / 3;
+             geometry.drawRange = { start: 0, count: 0 }; // Initialize draw range for animation
+             const crackleMaterial = new THREE.ShaderMaterial({ vertexShader: lightningLineVertexShader, fragmentShader: groundCrackleFragmentShader, uniforms: { uTime: { value: 0.0 }, uOpacity: { value: 1.0 }, uColor: { value: new THREE.Color(lightningParams.groundCrackleColor) }, uGlowColor: { value: new THREE.Color(lightningParams.groundCrackleGlowColor) } }, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending });
+             const crackle = new THREE.LineSegments(geometry, crackleMaterial);
+             // Store data for animation and disposal
+             crackle.userData = { startTime: Date.now(), material: crackleMaterial, duration: lightningParams.groundCrackleDuration, totalPoints: totalPoints, geometry: geometry };
+             scene.add(crackle); activeGroundCrackles.push(crackle); // Add to active list
+         }
+
+        // Remove lightning bolt and associated glow lines/geometry
+        function removeLightning(mainLightning) {
+            if (!mainLightning || !scene.getObjectById(mainLightning.id)) return;
+            const userData = mainLightning.userData;
+            scene.remove(mainLightning); // Remove main line
+            if (mainLightning.material) mainLightning.material.dispose();
+            // Remove glow lines
+            if (userData.glowLines) { userData.glowLines.forEach(line => { if (scene.getObjectById(line.id)) { scene.remove(line); if (line.material) line.material.dispose(); } }); }
+            // Dispose shared geometry once
+            if (userData.geometry) userData.geometry.dispose();
+            // Clear animation timeout
+            if (userData.drawTimeoutId) { clearTimeout(userData.drawTimeoutId); }
+        }
+
+        // Schedule the next lightning strike
+        function scheduleNextStrike() {
+            if (nextStrikeTimeoutId !== null) { clearTimeout(nextStrikeTimeoutId); }
+            const interval = lightningParams.strikeIntervalMin + Math.random() * (lightningParams.strikeIntervalMax - lightningParams.strikeIntervalMin);
+            nextStrikeTimeoutId = setTimeout(strike, interval);
+        }
+
+        // Main animation loop
+        function animate() {
+            requestAnimationFrame(animate);
+            const now = Date.now();
+            lastFrameTime = now;
+            const timeSeconds = now / 1000.0;
+            controls.update(); // Update camera controls
+
+            // Update uniforms for active main lightning bolts (only time needed after draw starts)
+            scene.traverse((object) => { if (object.isLineSegments && object.userData && object.userData.material && object.userData.material.uniforms.uTime && !object.userData.drawCompleted) { object.userData.material.uniforms.uTime.value = timeSeconds - object.userData.startTime / 1000.0; } });
+
+            // Animate active ground crackles (drawRange and opacity)
+            const cracklesToRemove = [];
+            activeGroundCrackles.forEach(crackle => {
+                const userData = crackle.userData; const material = userData.material; const geometry = userData.geometry;
+                const elapsed = now - userData.startTime; const duration = userData.duration;
+                const progress = Math.min(1.0, elapsed / duration);
+
+                if (progress >= 1.0) { // If effect duration is over
+                    cracklesToRemove.push(crackle); scene.remove(crackle); if (geometry) geometry.dispose(); if (material) material.dispose();
+                } else {
+                    // Animate drawRange (e.g., over first 60% of duration)
+                    const drawEndTime = duration * 0.6;
+                    const drawProgress = Math.min(1.0, elapsed / drawEndTime);
+                    const targetCount = Math.min(userData.totalPoints, Math.ceil(userData.totalPoints * drawProgress / 2) * 2);
+                    geometry.drawRange.count = targetCount;
+
+                    // Animate opacity (e.g., fade out during last 50% of duration)
+                    const fadeStartTime = duration * 0.5;
+                    const fadeDuration = duration * 0.5;
+                    const fadeProgress = Math.min(1.0, Math.max(0.0, (elapsed - fadeStartTime) / fadeDuration));
+                    material.uniforms.uOpacity.value = (1.0 - fadeProgress) * 0.95; // Fade out effect
+
+                    material.uniforms.uTime.value = timeSeconds; // Update time for flicker
+                }
+            });
+            // Remove finished crackles from the active list
+            activeGroundCrackles = activeGroundCrackles.filter(c => !cracklesToRemove.includes(c));
+
+            // Render scene via composer (applies bloom)
+            composer.render();
+        }
+    </script>
+</body>
+</html>
